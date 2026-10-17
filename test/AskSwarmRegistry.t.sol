@@ -382,23 +382,61 @@ contract AskSwarmRegistryTest is Test {
         assertEq(reg.latestFor(bytes32(uint256(0xef01))), id2, "11 of 20 is");
     }
 
-    /// Whatever the panel shape, an indexed answer is verified, unexpired and a strict majority of its panel.
-    function testFuzz_indexedAnswersAreMajorities(uint16 panel, uint16 quorum, uint16 agreed, uint32 ttl, uint32 late)
-        public
-    {
+    /// Whatever the panel shape, an indexed answer is verified, in its window (not expired, not issued
+    /// more than the tolerance ahead of the clock) and a strict majority of its panel.
+    function testFuzz_indexedAnswersAreMajorities(
+        uint16 panel,
+        uint16 quorum,
+        uint16 agreed,
+        uint32 ttl,
+        uint32 late,
+        uint32 ahead
+    ) public {
         panel = uint16(bound(panel, 2, 100));
         quorum = uint16(bound(quorum, 1, panel));
         agreed = uint16(bound(agreed, 0, panel));
+        uint64 issuedAt = uint64(block.timestamp + bound(ahead, 0, 10 minutes));
         uint64 expiresAt = uint64(block.timestamp + bound(ttl, 0, 30 days));
         bytes32 id = _ask();
         OracleAttestation memory a = _mintP(id, 0xf00d, hex"01", 0, panel, quorum, agreed, expiresAt);
+        a.issuedAt = issuedAt;
         bytes memory sig = _sign(reg, a);
         vm.warp(block.timestamp + bound(late, 0, 31 days));
         _deliver(id, a, sig);
         (, AskSwarmRegistry.Answer memory ans) = reg.get(id);
-        assertEq(ans.verified, agreed >= quorum && block.timestamp <= expiresAt);
+        bool inWindow = block.timestamp <= expiresAt && issuedAt <= block.timestamp + 5 minutes;
+        assertEq(ans.verified, agreed >= quorum && inWindow);
         bool isIndexed = reg.latestFor(bytes32(uint256(0xf00d))) == id;
         assertEq(isIndexed, ans.verified && uint256(agreed) * 2 > panel);
+    }
+
+    /// Audit finding 1b549341 through the mock etched at the real Intake address: a second open ask
+    /// cannot carry a re-delivery of a settled id, and the settled record is untouched.
+    function test_settledAskRefusesRedeliveryThroughAnotherOpenAsk() public {
+        bytes32 first = _ask();
+        OracleAttestation memory a = _mint(first, 0x4242, "CHF", 2, 11);
+        _deliver(first, a, _sign(reg, a));
+        (AskSwarmRegistry.Ask memory k, AskSwarmRegistry.Answer memory ans) = reg.get(first);
+        bytes32 before = keccak256(abi.encode(k, ans));
+
+        bytes32 second = _ask();
+        OracleAttestation memory b = _mint(first, 0x4242, "EUR", 2, 11);
+        bytes memory sig = _sign(reg, b);
+        vm.recordLogs();
+        vm.prank(IIntake(INTAKE).writer());
+        IIntake(INTAKE).complete(second, 0, bytes32(0), "", abi.encode(first, b, sig));
+        assertFalse(_delivered(), "re-delivery of a settled id must be refused");
+        (k, ans) = reg.get(first);
+        assertEq(keccak256(abi.encode(k, ans)), before, "settled record changed");
+        assertEq(ans.answer, bytes("CHF"));
+        assertEq(reg.latestFor(bytes32(uint256(0x4242))), first);
+
+        vm.prank(INTAKE);
+        vm.expectRevert(abi.encodeWithSelector(AskSwarmRegistry.AlreadySettled.selector, first));
+        reg.onOracleResult(first, b, sig);
+        vm.prank(INTAKE);
+        vm.expectRevert(abi.encodeWithSelector(AskSwarmRegistry.AlreadySettled.selector, first));
+        reg.onFailure(first, 2, bytes32("disagreed"), 0, 0, "");
     }
 
     /// Launch rule: the constructor calls no other contract, so it deploys on an empty chain, and

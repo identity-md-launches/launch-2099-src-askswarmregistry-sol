@@ -23,12 +23,16 @@ contract RegistrySequenceHandler is Test {
     uint256 public totalDonated;
     uint256 public failedAsks;
     uint256 public settlements;
+    uint256 public stranded;
 
     struct ExpectedAsk {
         address asker;
         uint64 askedAt;
         AskSwarmRegistry.Status status;
         bytes32 settledRecordHash;
+        // Completed in Intake by a writer that forwarded another (settled) id's arguments: the
+        // registry refused the replay, so this ask stays Pending here and can never be completed.
+        bool stranded;
     }
     mapping(bytes32 => ExpectedAsk) public expected;
 
@@ -50,7 +54,7 @@ contract RegistrySequenceHandler is Test {
         bytes32 id = registry.ask(abi.encode(body));
         vm.stopPrank();
         assertEq(expected[id].asker, address(0), "request ids must be unique");
-        expected[id] = ExpectedAsk(actor, uint64(block.timestamp), AskSwarmRegistry.Status.Pending, bytes32(0));
+        expected[id] = ExpectedAsk(actor, uint64(block.timestamp), AskSwarmRegistry.Status.Pending, bytes32(0), false);
         ids.push(id);
         paid[actor] += p;
         totalPaid += p;
@@ -208,10 +212,52 @@ contract RegistrySequenceHandler is Test {
         assertEq(keccak256(abi.encode(k, a)), beforeHash);
     }
 
+    /// Audit finding 1b549341: the live Intake forwards status-0 arguments unchecked, so a writer
+    /// could complete an open request with a settled id's arguments. The registry refuses the
+    /// replay (the call is not delivered), the settled record is byte-identical afterwards, and the
+    /// open request is left Pending here.
+    function replaySettledThroughOpenRequest(uint256 settledSeed, uint256 openSeed, uint8 questionSeed, bytes32 value)
+        public
+    {
+        (bytes32 settled, bool foundSettled) = _settled(settledSeed);
+        (bytes32 open, bool foundOpen) = _pending(openSeed);
+        if (!foundSettled || !foundOpen) return;
+        bytes32 question = questionHash(questionSeed % 4);
+        bytes32 heldBefore = registry.latestFor(question);
+        OracleAttestation memory a = OracleAttestation({
+            requestId: keccak256(abi.encode("oracle id", settled)),
+            chainId: 1,
+            questionHash: question,
+            answerType: 2,
+            answer: abi.encode(value),
+            figure: 0,
+            fromBlock: 100,
+            toBlock: 200,
+            blockHash: keccak256("block"),
+            panelJobId: keccak256(abi.encode(settled, open)),
+            panelSize: 100,
+            quorum: 2,
+            agreed: 100,
+            issuedAt: uint64(block.timestamp),
+            expiresAt: uint64(block.timestamp + 1 days)
+        });
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(KEY, registry.digest(a));
+        vm.prank(intake.writer());
+        bool delivered = intake.complete(open, 0, abi.encode(settled, a, abi.encodePacked(r, s, v)));
+        assertFalse(delivered, "registry accepted a re-delivery of a settled ask");
+        (AskSwarmRegistry.Ask memory k, AskSwarmRegistry.Answer memory actual) = registry.get(settled);
+        assertEq(keccak256(abi.encode(k, actual)), expected[settled].settledRecordHash, "settled record changed");
+        assertEq(registry.latestFor(question), heldBefore, "replay moved the index");
+        (AskSwarmRegistry.Ask memory ko,) = registry.get(open);
+        assertEq(uint8(ko.status), uint8(AskSwarmRegistry.Status.Pending), "replay settled the open ask");
+        expected[open].stranded = true;
+        stranded++;
+    }
+
     function retryCompletedRequest(uint256 idSeed) public {
         if (ids.length == 0) return;
         bytes32 id = ids[idSeed % ids.length];
-        if (expected[id].status == AskSwarmRegistry.Status.Pending) return;
+        if (expected[id].status == AskSwarmRegistry.Status.Pending && !expected[id].stranded) return;
         vm.prank(intake.writer());
         (bool ok, bytes memory reason) = address(intake)
             .call(
@@ -261,6 +307,7 @@ contract RegistrySequenceHandler is Test {
 
     function assertRecordsAndIndexes() external view {
         uint256 settled;
+        uint256 strandedSeen;
         for (uint256 i; i < ids.length; ++i) {
             bytes32 id = ids[i];
             ExpectedAsk memory e = expected[id];
@@ -269,14 +316,20 @@ contract RegistrySequenceHandler is Test {
             assertEq(k.askedAt, e.askedAt);
             assertEq(uint8(k.status), uint8(e.status));
             RecordingIntake.Request memory r = intake.requestInfo(id);
-            assertEq(r.completed, e.status != AskSwarmRegistry.Status.Pending);
+            assertEq(r.completed, e.status != AskSwarmRegistry.Status.Pending || e.stranded);
             if (e.status != AskSwarmRegistry.Status.Pending) {
                 ++settled;
                 assertTrue(r.delivered);
                 assertEq(keccak256(abi.encode(k, a)), e.settledRecordHash, "settled record changed");
+            } else {
+                assertFalse(r.delivered);
+                assertFalse(a.verified);
+                assertEq(a.answerHash, bytes32(0), "pending ask reads as answered");
+                if (e.stranded) ++strandedSeen;
             }
         }
         assertEq(settled, settlements);
+        assertEq(strandedSeen, stranded);
         for (uint256 i; i < 4; ++i) {
             bytes32 question = questionHash(i);
             (bytes32 id, AskSwarmRegistry.Answer memory a) = registry.answerOf(question);
@@ -306,7 +359,18 @@ contract RegistrySequenceHandler is Test {
         uint256 start = seed % length;
         for (uint256 i; i < length; ++i) {
             id = ids[(start + i) % length];
-            if (expected[id].status == AskSwarmRegistry.Status.Pending) return (id, true);
+            if (expected[id].status == AskSwarmRegistry.Status.Pending && !expected[id].stranded) return (id, true);
+        }
+        return (id, false);
+    }
+
+    function _settled(uint256 seed) internal view returns (bytes32 id, bool found) {
+        uint256 length = ids.length;
+        if (length == 0) return (id, false);
+        uint256 start = seed % length;
+        for (uint256 i; i < length; ++i) {
+            id = ids[(start + i) % length];
+            if (expected[id].status != AskSwarmRegistry.Status.Pending) return (id, true);
         }
         return (id, false);
     }
@@ -323,7 +387,7 @@ contract AskSwarmRegistryInvariantTest is RegistryTestSupport {
         address charlie = makeAddr("payment charlie");
         token.mint(charlie, 100 ether);
         handler = new RegistrySequenceHandler(registry, token, intake, [alice, bob, charlie]);
-        bytes4[] memory selectors = new bytes4[](8);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.ask.selector;
         selectors[1] = handler.failingAsk.selector;
         selectors[2] = handler.donate.selector;
@@ -332,18 +396,22 @@ contract AskSwarmRegistryInvariantTest is RegistryTestSupport {
         selectors[5] = handler.advanceTime.selector;
         selectors[6] = handler.unauthorizedCallback.selector;
         selectors[7] = handler.retryCompletedRequest.selector;
+        selectors[8] = handler.replaySettledThroughOpenRequest.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
 
-        // Guarantee a live pending request, an indexed answer, a failure, a donation and a
-        // reverted ask even in sequences whose random calls otherwise miss those states.
+        // Guarantee a live pending request, an indexed answer, a failure, a donation, a reverted
+        // ask and a refused replay even in sequences whose random calls otherwise miss those states.
         handler.ask(0, 0.5 ether, bytes32("first"));
         handler.ask(1, 0.5 ether, bytes32("second"));
         handler.ask(2, 1, bytes32("pending"));
+        handler.ask(2, 1, bytes32("stranded"));
         handler.answer(0, 0, 15, 11, 3600, 0, bytes32("answer"));
         handler.refuse(1, true, bytes32("disagreed"), 10);
         handler.donate(2, 1);
         handler.failingAsk(1, 3);
+        handler.replaySettledThroughOpenRequest(0, 3, 0, bytes32("replay"));
+        assertEq(handler.stranded(), 1);
     }
 
     function invariant_paymentsAreConservedAndNoFeeIsRetained() public view {

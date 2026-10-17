@@ -215,8 +215,12 @@ question hash. Any contract or client can then read what the swarm attested, fre
 The registry was launched through the IMD protocol itself: [launch #2088](https://explorer.imd.fun/launches/11fd096c-23fe-45a1-a957-20dd29747efa)
 (swarm audit of the import, adaptation, tests, four specialist audits, judge, deploy), job
 [64fa31ee](https://explorer.imd.fun/jobs/64fa31ee-3f0c-493f-b7ad-b2d93eb8b852). What the swarm changed
-and why is in [contracts/ADAPTATION.md](contracts/ADAPTATION.md); `src/` and `test/` here are the
-accepted versions.
+and why is in [contracts/ADAPTATION.md](contracts/ADAPTATION.md). The current `src/` and `test/` are
+that accepted version plus the fixes from the second launch's audit, listed in
+[ADAPTATION.md](ADAPTATION.md): each ask is settled once (`AlreadySettled`, whatever Intake relays),
+`verified` also requires `issuedAt` at most 5 minutes ahead of the chain clock, and a record with no
+stored answer reads back with a zero `answerHash`. The address of that relaunch comes from the
+deployment handoff once it is live.
 
 | chain | AskSwarmRegistry |
 |---|---|
