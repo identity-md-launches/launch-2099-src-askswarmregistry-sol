@@ -162,9 +162,13 @@ contract RegistrySequenceHandler is Test {
         if (!valid || agreed <= panel / 2) {
             assertEq(nowHeld, previouslyHeld, "invalid or minority answer changed the index");
         } else if (
-            held.verified && block.timestamp <= held.expiresAt && (panel < held.panelSize || agreed < held.agreed)
+            held.verified && block.timestamp <= held.expiresAt
+                && (panel < held.panelSize
+                    || agreed < held.agreed
+                    || a.issuedAt < held.issuedAt
+                    || a.expiresAt < held.expiresAt)
         ) {
-            assertEq(nowHeld, previouslyHeld, "weaker answer displaced a current stronger answer");
+            assertEq(nowHeld, previouslyHeld, "weaker, staler or shorter-lived answer displaced a current answer");
         } else {
             assertEq(nowHeld, id, "eligible answer was not indexed");
         }
@@ -254,6 +258,57 @@ contract RegistrySequenceHandler is Test {
         stranded++;
     }
 
+    /// Review finding a97feadf, consequence (a): anyone may point the index at a recorded answer
+    /// under the delivery rule, strict on ties. The expectation is computed from the read API
+    /// against the currently held answer, not from the contract's own helper.
+    function reindex(uint256 idSeed) public {
+        if (ids.length == 0) return;
+        bytes32 id = ids[idSeed % ids.length];
+        (, AskSwarmRegistry.Answer memory c) = registry.get(id);
+        bytes32 question = c.questionHash;
+        bytes32 heldId = registry.latestFor(question);
+        (, AskSwarmRegistry.Answer memory h) = registry.get(heldId);
+        bool heldCurrent = h.verified && block.timestamp <= h.expiresAt;
+        bool eligible = c.verified && block.timestamp <= c.expiresAt && c.agreed > c.panelSize / 2;
+        bool atLeast = c.panelSize >= h.panelSize && c.agreed >= h.agreed && c.issuedAt >= h.issuedAt
+            && c.expiresAt >= h.expiresAt;
+        bool beats =
+            c.panelSize > h.panelSize || c.agreed > h.agreed || c.issuedAt > h.issuedAt || c.expiresAt > h.expiresAt;
+        bool shouldMove = eligible && (!heldCurrent || (atLeast && beats));
+        (bool ok, bytes memory reason) = address(registry).call(abi.encodeCall(registry.reindex, (id)));
+        assertEq(ok, shouldMove, "reindex accepted or refused against the rule");
+        if (!ok) assertEq(reason, abi.encodeWithSelector(AskSwarmRegistry.NotEligible.selector, id));
+        assertEq(registry.latestFor(question), ok ? id : heldId, "reindex moved the index wrongly");
+        if (ok) assertTrue(registry.isCurrent(question));
+    }
+
+    /// Review finding 8f2c2abc: a Pending ask that Intake has completed (here: stranded by a replay)
+    /// can be settled as Lost by anyone; an open or settled ask cannot.
+    function markLost(uint256 idSeed) public {
+        if (ids.length == 0) return;
+        bytes32 id = ids[idSeed % ids.length];
+        ExpectedAsk memory e = expected[id];
+        (bool ok, bytes memory reason) = address(registry).call(abi.encodeCall(registry.markLost, (id)));
+        if (e.status == AskSwarmRegistry.Status.Pending && e.stranded) {
+            assertTrue(ok, "completed-but-undelivered ask could not be marked lost");
+            (AskSwarmRegistry.Ask memory k, AskSwarmRegistry.Answer memory a) = registry.get(id);
+            assertEq(uint8(k.status), uint8(AskSwarmRegistry.Status.Lost));
+            assertFalse(a.verified);
+            assertEq(a.answerHash, bytes32(0));
+            expected[id].status = AskSwarmRegistry.Status.Lost;
+            expected[id].settledRecordHash = keccak256(abi.encode(k, a));
+            settlements++;
+        } else {
+            assertFalse(ok, "open or settled ask was marked lost");
+            assertEq(
+                reason,
+                e.status == AskSwarmRegistry.Status.Pending
+                    ? abi.encodeWithSelector(AskSwarmRegistry.StillOpen.selector, id)
+                    : abi.encodeWithSelector(AskSwarmRegistry.AlreadySettled.selector, id)
+            );
+        }
+    }
+
     function retryCompletedRequest(uint256 idSeed) public {
         if (ids.length == 0) return;
         bytes32 id = ids[idSeed % ids.length];
@@ -317,15 +372,16 @@ contract RegistrySequenceHandler is Test {
             assertEq(uint8(k.status), uint8(e.status));
             RecordingIntake.Request memory r = intake.requestInfo(id);
             assertEq(r.completed, e.status != AskSwarmRegistry.Status.Pending || e.stranded);
+            if (e.stranded) ++strandedSeen;
             if (e.status != AskSwarmRegistry.Status.Pending) {
                 ++settled;
-                assertTrue(r.delivered);
+                assertEq(r.delivered, e.status != AskSwarmRegistry.Status.Lost, "Lost is only for undelivered");
                 assertEq(keccak256(abi.encode(k, a)), e.settledRecordHash, "settled record changed");
+                if (e.status == AskSwarmRegistry.Status.Lost) assertEq(a.answerHash, bytes32(0));
             } else {
                 assertFalse(r.delivered);
                 assertFalse(a.verified);
                 assertEq(a.answerHash, bytes32(0), "pending ask reads as answered");
-                if (e.stranded) ++strandedSeen;
             }
         }
         assertEq(settled, settlements);
@@ -387,7 +443,7 @@ contract AskSwarmRegistryInvariantTest is RegistryTestSupport {
         address charlie = makeAddr("payment charlie");
         token.mint(charlie, 100 ether);
         handler = new RegistrySequenceHandler(registry, token, intake, [alice, bob, charlie]);
-        bytes4[] memory selectors = new bytes4[](9);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = handler.ask.selector;
         selectors[1] = handler.failingAsk.selector;
         selectors[2] = handler.donate.selector;
@@ -397,21 +453,29 @@ contract AskSwarmRegistryInvariantTest is RegistryTestSupport {
         selectors[6] = handler.unauthorizedCallback.selector;
         selectors[7] = handler.retryCompletedRequest.selector;
         selectors[8] = handler.replaySettledThroughOpenRequest.selector;
+        selectors[9] = handler.reindex.selector;
+        selectors[10] = handler.markLost.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
 
         // Guarantee a live pending request, an indexed answer, a failure, a donation, a reverted
-        // ask and a refused replay even in sequences whose random calls otherwise miss those states.
+        // ask, a refused replay, a stranded ask and a lost one even in sequences whose random calls
+        // otherwise miss those states.
         handler.ask(0, 0.5 ether, bytes32("first"));
         handler.ask(1, 0.5 ether, bytes32("second"));
         handler.ask(2, 1, bytes32("pending"));
         handler.ask(2, 1, bytes32("stranded"));
+        handler.ask(0, 1, bytes32("lost"));
         handler.answer(0, 0, 15, 11, 3600, 0, bytes32("answer"));
         handler.refuse(1, true, bytes32("disagreed"), 10);
         handler.donate(2, 1);
         handler.failingAsk(1, 3);
         handler.replaySettledThroughOpenRequest(0, 3, 0, bytes32("replay"));
-        assertEq(handler.stranded(), 1);
+        handler.replaySettledThroughOpenRequest(0, 4, 1, bytes32("replay"));
+        handler.markLost(4);
+        assertEq(handler.stranded(), 2);
+        (AskSwarmRegistry.Ask memory lost,) = registry.get(handler.ids(4));
+        assertEq(uint8(lost.status), uint8(AskSwarmRegistry.Status.Lost));
     }
 
     function invariant_paymentsAreConservedAndNoFeeIsRetained() public view {

@@ -27,6 +27,7 @@ export const ACTION_ID = stringToHex("oracle.request@oracle-1", { size: 32 });
 export const REGISTRY = (process.env.REGISTRY_ADDRESS || null) as Hex | null;
 export const registryAbi = parseAbi([
   "function ask(bytes body) returns (bytes32 requestId)",
+  "function askAtMost(bytes body, uint256 maxPrice) returns (bytes32 requestId)",
   "function price() view returns (uint256)",
   "function latestFor(bytes32 questionHash) view returns (bytes32)",
   "function get(bytes32 requestId) view returns ((address asker, uint64 askedAt, uint8 status) k, (bytes32 questionHash, bytes answer, bytes32 answerHash, uint8 answerType, uint16 panelSize, uint16 quorum, uint16 agreed, uint64 issuedAt, uint64 expiresAt, bool verified) a)",
@@ -78,7 +79,9 @@ export const registryBody = (chainId: IntakeChainId, body: OracleRequestBody) =>
 export async function ask(chainId: IntakeChainId, account: PrivateKeyAccount, body: OracleRequestBody): Promise<Hex> {
   const { wallet } = clients(chainId, account);
   if (REGISTRY) {
-    return wallet.writeContract({ address: REGISTRY, abi: registryAbi, functionName: "ask", args: [stringToHex(JSON.stringify(registryBody(chainId, body)))] });
+    // The house approves twenty asks at once (ensureAllowance), so cap each ask at the price it was
+    // quoted: if Intake's owner moves the price first, the ask reverts instead of paying it silently.
+    return wallet.writeContract({ address: REGISTRY, abi: registryAbi, functionName: "askAtMost", args: [stringToHex(JSON.stringify(registryBody(chainId, body))), PRICE] });
   }
   // ponytail: no nonce manager; one hot wallet, low volume. Add viem nonceManager if webhooks ever overlap.
   return wallet.writeContract({
@@ -128,6 +131,6 @@ export async function registryRecord(chainId: IntakeChainId, intakeRequestId: He
   const c = CHAINS[chainId];
   const pub = createPublicClient({ chain: c.chain, transport: http(process.env[c.rpcEnv]) });
   const [k, a] = await pub.readContract({ address: REGISTRY, abi: registryAbi, functionName: "get", args: [intakeRequestId] });
-  const status = (["none", "pending", "answered", "refused", "no result", "unverified"] as const)[k.status] ?? "?";
+  const status = (["none", "pending", "answered", "refused", "no result", "unverified", "lost"] as const)[k.status] ?? "?";
   return { status, verified: a.verified, agreed: a.agreed, panelSize: a.panelSize };
 }

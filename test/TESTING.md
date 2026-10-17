@@ -21,14 +21,22 @@ FOUNDRY_FUZZ_SEED=0xd094d872360bfdb7dab18e96fc214e6614b324111bad9f9dd12ad8e4b5d7
   completion of another open request that names the settled id), `issuedAt` more than 5 minutes
   ahead of the chain clock is recorded `Unverified`, and records with no stored answer read back
   with a zero `answerHash`.
+- `AskSwarmRegistryReview.t.sol` covers the independent review of the second launch: the index
+  respects an answer's validity window and issue time (a 60-second equal-strength answer cannot
+  evict a 30-day one, an older answer delivered later cannot displace a newer one, ties go to the
+  later delivery), `reindex` as the fallback once a held answer expires (strict dominance among
+  fallbacks, every ineligible record refused, the `Indexed` event), `askAtMost` as a price ceiling,
+  and `markLost` for asks Intake completed without delivering (`Lost`, terminal, appended status code).
 - `AskSwarmRegistryInvariant.t.sol` runs 256 sequences of 96 calls with three funded callers.
-  Nine handlers exercise successful and reverted asks, donations, signed/invalid/expired/oversized
-  answers, refusals, time changes, unauthorized callbacks, transport retries, and replays of a
-  settled id through an open request. Ghost accounting tracks each caller's payments and donations.
+  Eleven handlers exercise successful and reverted asks, donations, signed/invalid/expired/oversized
+  answers, refusals, time changes, unauthorized callbacks, transport retries, replays of a settled
+  id through an open request, `reindex` on random records against the rule computed from the read
+  API, and `markLost` on random asks. Ghost accounting tracks each caller's payments and donations.
   Checks cover conservation, exact fee forwarding, zero remaining Intake approval, request counts,
-  immutable settled records under any writer behaviour, pending asks reading as unanswered, and
-  coherent majority-only question indexes. Seeded setup reaches meaningful states even before
-  random calls begin. Unexpected handler reverts fail the campaign.
+  immutable settled records under any writer behaviour, pending asks reading as unanswered, Lost
+  only for undelivered completions, and coherent majority-only question indexes. Seeded setup
+  reaches meaningful states even before random calls begin. Unexpected handler reverts fail the
+  campaign.
 - Existing `OracleConsumerConformance.t.sol` retains the independent protocol digest/signature
   vector. New signature tests complement that vector; signing the registry's own digest alone
   would not prove protocol compatibility.

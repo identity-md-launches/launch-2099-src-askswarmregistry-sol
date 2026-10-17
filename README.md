@@ -219,8 +219,16 @@ and why is in [contracts/ADAPTATION.md](contracts/ADAPTATION.md). The current `s
 that accepted version plus the fixes from the second launch's audit, listed in
 [ADAPTATION.md](ADAPTATION.md): each ask is settled once (`AlreadySettled`, whatever Intake relays),
 `verified` also requires `issuedAt` at most 5 minutes ahead of the chain clock, and a record with no
-stored answer reads back with a zero `answerHash`. The address of that relaunch comes from the
-deployment handoff once it is live.
+stored answer reads back with a zero `answerHash`. The independent review of that launch added:
+the canonical answer for a question only gives way to one at least as strong, as fresh and valid
+at least as long, so a 60-second answer cannot cut a 30-day one short; `reindex(requestId)` lets
+anyone point the index at a still-valid recorded answer once the held one has expired;
+`askAtMost(body, maxPrice)` caps what an ask may pull (the bot uses it with the price it quoted);
+and `markLost(requestId)` settles an ask Intake completed without reaching either hook (status
+`Lost`, code 6). Note that the plane's `questionHash` covers the question, its resolved block
+window and the definitions: asks with a relative window (`{"hours":24}`, what the bot sends) each
+get their own key, so only absolute-window asks share one. The address of that relaunch comes from
+the deployment handoff once it is live.
 
 | chain | AskSwarmRegistry |
 |---|---|

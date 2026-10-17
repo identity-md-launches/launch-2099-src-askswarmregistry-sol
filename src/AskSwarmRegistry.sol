@@ -27,9 +27,17 @@ import {IIntake, OracleAttestation} from "./IIntake.sol";
 ///   Verified proves the swarm signed this answer for this contract; the pairing of an answer with
 ///   the ask that bought it is the writer's, as it is for every Intake consumer.
 /// - `latestFor[questionHash]` only indexes an answer a strict majority of its own panel agreed on
-///   (`agreed * 2 > panelSize`), and only moves to one at least as strong as the one it holds
-///   (panel size and agreement), unless the held one has expired. A weak panel cannot overwrite
-///   a strong one, and a large panel's minority plurality cannot either.
+///   (`agreed * 2 > panelSize`), and while the one it holds is verified and unexpired it only moves
+///   to an answer at least as strong (panel size and agreement), at least as fresh (`issuedAt`) and
+///   valid at least as long (`expiresAt`). A weak panel cannot overwrite a strong one, a large
+///   panel's minority plurality cannot either, and a short-lived answer cannot cut a long-lived
+///   one's validity short. Once the held answer has expired, any eligible answer may take the
+///   index: the next delivery does so, and `reindex` lets anyone point it at an answer already on
+///   record, so a verified answer is never left dark behind an expired one.
+/// - `ask` pulls exactly the price Intake quotes in the same transaction; `askAtMost` lets the
+///   caller cap it, so a standing allowance cannot be spent at a price the caller never saw.
+/// - An ask settles once, through Intake's hooks or, when Intake has completed the request without
+///   reaching either hook, through `markLost`, which anyone may call and which touches no answer.
 ///
 /// Lifecycle: this registry is pinned to Intake v2, the oracle.request action (version oracle-1), and one
 /// attester key. If IMD retires the action (`setPrice` to 0) or rotates the attester, `ask` stops
@@ -44,7 +52,8 @@ contract AskSwarmRegistry {
         Answered, // verified attestation stored
         Refused, // plane refused the ask (status 1)
         NoResult, // panel split or job failed (status 2)
-        Unverified // delivered, but the signature or pairing did not check out; stored for the record
+        Unverified, // delivered, but the signature or pairing did not check out; stored for the record
+        Lost // Intake completed the request but neither hook settled it here; marked through `markLost`
     }
 
     struct Ask {
@@ -116,8 +125,13 @@ contract AskSwarmRegistry {
 
     mapping(bytes32 requestId => Ask) public asks;
     mapping(bytes32 requestId => Stored) private _answers;
-    /// @notice Latest verified answer for a question hash (keccak256 of the normalized question,
-    /// as the plane computes it and puts in the attestation).
+    /// @notice The verified answer this registry holds as canonical for a question hash.
+    /// `questionHash` is the plane's, as signed in the attestation: it covers the normalized
+    /// question, the resolved block window and the definitions. Asks with a relative window
+    /// (`{"hours":N}`) resolve to a different window each time, so they never share a key and the
+    /// displacement rule never engages between them; only absolute-window asks
+    /// (`{"fromBlock","toBlock"}`) repeat a key, and only for those can a reader compute it ahead
+    /// of time. Readers take the key from the `Answered` event or the attestation document.
     mapping(bytes32 questionHash => bytes32 requestId) public latestFor;
     uint256 public asked;
 
@@ -137,12 +151,19 @@ contract AskSwarmRegistry {
         bool verified
     );
     event Failed(bytes32 indexed requestId, uint8 status, bytes32 reason, uint16 agreed, uint16 answered);
+    /// @notice `latestFor[questionHash]` now points at `requestId` (from a delivery or `reindex`).
+    event Indexed(bytes32 indexed questionHash, bytes32 indexed requestId);
+    /// @notice Intake completed the request without a result or failure reaching this registry.
+    event Lost(bytes32 indexed requestId);
 
     error NotIntake();
     error UnknownAsk(bytes32 requestId);
     error AlreadySettled(bytes32 requestId);
     error TransferFailed();
     error NotSold();
+    error PriceAboveMax(uint256 price, uint256 maxPrice);
+    error StillOpen(bytes32 requestId);
+    error NotEligible(bytes32 requestId);
     error ZeroAddress();
 
     constructor(address intake, address imd, address signer) {
@@ -166,10 +187,23 @@ contract AskSwarmRegistry {
 
     /// @notice Pay the swarm's price and ask. `body` is the oracle.request JSON (same as the HTTP
     /// door): {"v":1,"question":...,"chainId":...,"answerType":...,"panelSize":...,"quorum":...}.
-    /// Caller must have approved this contract for `price()` IMD.
+    /// Caller must have approved this contract for `price()` IMD. Pays whatever Intake quotes when the
+    /// call is mined; a caller with a standing allowance who wants a ceiling uses `askAtMost`.
     function ask(bytes calldata body) external returns (bytes32 requestId) {
+        return _ask(body, type(uint256).max);
+    }
+
+    /// @notice Same as `ask`, but reverts `PriceAboveMax` when Intake's price at execution exceeds
+    /// `maxPrice`, so an approval larger than one ask (the bot approves twenty) cannot be spent at a
+    /// price the caller never saw.
+    function askAtMost(bytes calldata body, uint256 maxPrice) external returns (bytes32 requestId) {
+        return _ask(body, maxPrice);
+    }
+
+    function _ask(bytes calldata body, uint256 maxPrice) internal returns (bytes32 requestId) {
         uint256 p = price();
         if (p == 0) revert NotSold();
+        if (p > maxPrice) revert PriceAboveMax(p, maxPrice);
         _call(IMD, abi.encodeWithSelector(0x23b872dd, msg.sender, address(this), p));
         // Intake pulls exactly `p`, so the allowance is back to zero after the request.
         _call(IMD, abi.encodeWithSelector(0x095ea7b3, address(INTAKE), p));
@@ -234,14 +268,17 @@ contract AskSwarmRegistry {
             stored: true
         });
         // Index only verified answers a strict majority of their panel agreed on (the asker picks
-        // panelSize and quorum, so quorum alone says nothing), and never let a weaker panel displace
-        // a stronger one that is still current. Strength = panel size and agreement, both at least as large.
-        if (ok && uint256(a.agreed) * 2 > a.panelSize) {
-            Stored storage cur = _answers[latestFor[a.questionHash]];
-            bool held = cur.verified && block.timestamp <= cur.expiresAt;
-            if (!held || (a.panelSize >= cur.panelSize && a.agreed >= cur.agreed)) {
-                latestFor[a.questionHash] = requestId;
-            }
+        // panelSize and quorum, so quorum alone says nothing), and never let a weaker, staler or
+        // shorter-lived answer displace one that is still current (`_mayDisplace`). The held
+        // record's fields share one slot, so this is a single extra cold read.
+        if (
+            ok && uint256(a.agreed) * 2 > a.panelSize
+                && _mayDisplace(
+                    _answers[latestFor[a.questionHash]], a.panelSize, a.agreed, a.issuedAt, a.expiresAt, false
+                )
+        ) {
+            latestFor[a.questionHash] = requestId;
+            emit Indexed(a.questionHash, requestId);
         }
         emit Answered(
             requestId,
@@ -273,6 +310,61 @@ contract AskSwarmRegistry {
         if (k.status != Status.Pending) revert AlreadySettled(requestId);
         k.status = status == 1 ? Status.Refused : Status.NoResult;
         emit Failed(requestId, status, reason, agreed, answeredCount);
+    }
+
+    // ---- settle and index without Intake ----
+
+    /// @notice Settle a `Pending` ask that Intake has completed without either hook landing here:
+    /// a completion whose arguments named another id, calldata the hook could not decode, a callback
+    /// that ran out of Intake's stipend, or a failure completion with empty arguments. Intake
+    /// completes a request once, so nothing can reach the hooks afterwards and the ask would read
+    /// `Pending` forever. Anyone may call it; it reads Intake's own record and touches no answer.
+    function markLost(bytes32 requestId) external {
+        Ask storage k = asks[requestId];
+        if (k.asker == address(0)) revert UnknownAsk(requestId);
+        if (k.status != Status.Pending) revert AlreadySettled(requestId);
+        (,,, bool completed) = INTAKE.requests(requestId);
+        if (!completed) revert StillOpen(requestId);
+        k.status = Status.Lost;
+        emit Lost(requestId);
+    }
+
+    /// @notice Point `latestFor` at an answer already on record. Anyone may call it, under the same
+    /// rule a delivery follows: the answer is verified, unexpired and a strict majority of its
+    /// panel, and the index either holds nothing current or holds an answer this one beats or
+    /// matches on every count (panel, agreement, issuedAt, expiresAt) and beats on at least one.
+    /// This is the fallback for an answer that arrived while a stronger but shorter-lived one was
+    /// current: once that one expires, the index would otherwise stay dark although a verified
+    /// answer is still valid. Exact ties cannot be flipped back and forth: they need a delivery.
+    function reindex(bytes32 requestId) external {
+        Stored storage s = _answers[requestId];
+        bytes32 q = s.questionHash;
+        if (
+            !s.verified || block.timestamp > s.expiresAt || uint256(s.agreed) * 2 <= s.panelSize
+                || !_mayDisplace(_answers[latestFor[q]], s.panelSize, s.agreed, s.issuedAt, s.expiresAt, true)
+        ) revert NotEligible(requestId);
+        latestFor[q] = requestId;
+        emit Indexed(q, requestId);
+    }
+
+    /// @dev Whether a candidate (already known to be verified, unexpired and a majority) may take
+    /// the index from `cur`: always when `cur` is not a verified, unexpired answer; otherwise only
+    /// when the candidate is at least as strong (panel, agreement), as fresh (issuedAt) and as
+    /// long-lived (expiresAt). With `strict`, matching on all four is not enough.
+    function _mayDisplace(
+        Stored storage cur,
+        uint16 panelSize,
+        uint16 agreed,
+        uint64 issuedAt,
+        uint64 expiresAt,
+        bool strict
+    ) internal view returns (bool) {
+        if (!cur.verified || block.timestamp > cur.expiresAt) return true;
+        if (panelSize < cur.panelSize || agreed < cur.agreed || issuedAt < cur.issuedAt || expiresAt < cur.expiresAt) {
+            return false;
+        }
+        return !strict || panelSize > cur.panelSize || agreed > cur.agreed || issuedAt > cur.issuedAt
+            || expiresAt > cur.expiresAt;
     }
 
     // ---- read ----
