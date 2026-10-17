@@ -10,8 +10,10 @@ import {PaymentToken, RecordingIntake, RegistryTestSupport} from "./helpers/Regi
 /// signature, oversized answer, a field changed after signing, pre-dated issuance, odd failure
 /// statuses, direct hook calls and replays of settled ids) beside honest ones, and checks after
 /// every call, whichever handler made it, that the question index only moved the way the contract
-/// promises: to a verified strict majority of the same question, and never to a weaker panel while
-/// the held answer was current. Settled records are snapshotted and must never change.
+/// promises: to a verified strict majority of the same question, and, while the held answer was
+/// current, only to one at least as strong, as fresh and as long-lived (strictly better on one
+/// count when `reindex` moved it). Asks Intake completed without delivering are settled `Lost`
+/// through `markLost` and nothing else. Settled records are snapshotted and must never change.
 contract IndexTransitionHandler is Test {
     uint256 internal constant N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
     uint256 internal constant QUESTIONS = 3;
@@ -31,12 +33,17 @@ contract IndexTransitionHandler is Test {
     uint256 public indexMoves;
     uint256 public verifiedDeliveries;
     uint256 public hostileDeliveries;
+    uint256 public reindexMoves;
+    uint256 public lostMarked;
+    bool internal strictMove;
 
     struct Held {
         bytes32 id;
         bool current;
         uint16 panelSize;
         uint16 agreed;
+        uint64 issuedAt;
+        uint64 expiresAt;
     }
 
     constructor(
@@ -60,9 +67,16 @@ contract IndexTransitionHandler is Test {
         for (uint256 q; q < QUESTIONS; ++q) {
             bytes32 id = registry.latestFor(question(q));
             (, AskSwarmRegistry.Answer memory a) = registry.get(id);
-            before[q] =
-                Held(id, id != bytes32(0) && a.verified && block.timestamp <= a.expiresAt, a.panelSize, a.agreed);
+            before[q] = Held(
+                id,
+                id != bytes32(0) && a.verified && block.timestamp <= a.expiresAt,
+                a.panelSize,
+                a.agreed,
+                a.issuedAt,
+                a.expiresAt
+            );
         }
+        strictMove = false;
         _;
         for (uint256 q; q < QUESTIONS; ++q) {
             bytes32 id = registry.latestFor(question(q));
@@ -76,6 +90,15 @@ contract IndexTransitionHandler is Test {
             if (before[q].current) {
                 assertGe(a.panelSize, before[q].panelSize, "smaller panel displaced a current answer");
                 assertGe(a.agreed, before[q].agreed, "weaker agreement displaced a current answer");
+                assertGe(a.issuedAt, before[q].issuedAt, "older answer displaced a current answer");
+                assertGe(a.expiresAt, before[q].expiresAt, "shorter-lived answer displaced a current answer");
+                if (strictMove) {
+                    assertTrue(
+                        a.panelSize > before[q].panelSize || a.agreed > before[q].agreed
+                            || a.issuedAt > before[q].issuedAt || a.expiresAt > before[q].expiresAt,
+                        "reindex flipped an exact tie"
+                    );
+                }
             }
         }
         for (uint256 i; i < ids.length; ++i) {
@@ -117,8 +140,10 @@ contract IndexTransitionHandler is Test {
         a.panelSize = uint16(bound(panelSeed, 2, 100));
         a.agreed = uint16(bound(agreedSeed, 1, a.panelSize));
         a.quorum = uint16(bound(quorumSeed, 1, a.agreed));
-        // Mostly fresh, sometimes up to 10 minutes ahead (beyond the 5-minute tolerance).
+        // Mostly fresh, sometimes up to 10 minutes ahead (beyond the 5-minute tolerance), sometimes
+        // issued up to a day before delivery (older than the held answer).
         a.issuedAt = uint64(block.timestamp + (issuedSeed % 4 == 0 ? bound(issuedSeed, 0, 10 minutes) : 0));
+        if (issuedSeed % 4 == 1) a.issuedAt -= uint64(bound(issuedSeed >> 2, 0, 1 days));
         a.expiresAt = uint64(block.timestamp + bound(lifeSeed, 0, 2 days));
         a.panelJobId = keccak256(abi.encode("job", id));
 
@@ -173,6 +198,53 @@ contract IndexTransitionHandler is Test {
         vm.prank(intake.writer());
         assertFalse(intake.complete(open, 0, abi.encode(target, a, abi.encodePacked(r, s, v))), "replay delivered");
         stranded[open] = true;
+    }
+
+    /// Intake completes a pending ask with a failure status and no arguments: no hook runs and the
+    /// ask is stranded `Pending` until someone calls `markLost`.
+    function strand(uint256 idSeed, uint8 statusSeed) external observed {
+        (bytes32 id, bool found) = _pending(idSeed);
+        if (!found) return;
+        vm.prank(intake.writer());
+        assertFalse(intake.complete(id, uint8(bound(statusSeed, 1, 2)), ""), "empty failure reached a hook");
+        stranded[id] = true;
+    }
+
+    /// Anyone may call `markLost`: it settles exactly the asks Intake completed without delivering,
+    /// refuses open ones with `StillOpen`, and settled ones (and unknown ids) unchanged.
+    function markLost(uint256 idSeed, uint256 callerSeed) external observed {
+        bytes32 id = ids.length == 0 ? bytes32(idSeed) : ids[idSeed % ids.length];
+        vm.prank(actors[callerSeed % actors.length]);
+        (bool ok, bytes memory reason) = address(registry).call(abi.encodeCall(registry.markLost, (id)));
+        if (ids.length == 0) {
+            assertEq(reason, abi.encodeWithSelector(AskSwarmRegistry.UnknownAsk.selector, id));
+        } else if (settled[id]) {
+            assertEq(reason, abi.encodeWithSelector(AskSwarmRegistry.AlreadySettled.selector, id));
+        } else if (stranded[id]) {
+            assertTrue(ok, "a stranded ask could not be marked lost");
+            (AskSwarmRegistry.Ask memory k, AskSwarmRegistry.Answer memory a) = registry.get(id);
+            assertEq(uint8(k.status), uint8(AskSwarmRegistry.Status.Lost));
+            assertEq(a.answerHash, bytes32(0), "markLost wrote an answer");
+            ++lostMarked;
+            _settle(id);
+        } else {
+            assertEq(reason, abi.encodeWithSelector(AskSwarmRegistry.StillOpen.selector, id));
+        }
+    }
+
+    /// Anyone points the index at any record; the observed modifier checks every move it makes.
+    function reindex(uint256 idSeed, uint256 callerSeed) external observed {
+        bytes32 id = ids.length == 0 ? bytes32(idSeed) : ids[idSeed % ids.length];
+        strictMove = true;
+        vm.prank(actors[callerSeed % actors.length]);
+        (bool ok, bytes memory reason) = address(registry).call(abi.encodeCall(registry.reindex, (id)));
+        if (ok) {
+            ++reindexMoves;
+            (, AskSwarmRegistry.Answer memory a) = registry.get(id);
+            assertEq(registry.latestFor(a.questionHash), id);
+        } else {
+            assertEq(reason, abi.encodeWithSelector(AskSwarmRegistry.NotEligible.selector, id));
+        }
     }
 
     /// Anyone but Intake, including the writer and the registry itself, is refused by both hooks.
@@ -236,13 +308,16 @@ contract AskSwarmRegistryIndexInvariantTest is RegistryTestSupport {
         vm.prank(carol);
         token.approve(address(registry), type(uint256).max);
 
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.ask.selector;
         selectors[1] = handler.deliver.selector;
         selectors[2] = handler.fail.selector;
         selectors[3] = handler.replay.selector;
         selectors[4] = handler.directHook.selector;
         selectors[5] = handler.warp.selector;
+        selectors[6] = handler.strand.selector;
+        selectors[7] = handler.markLost.selector;
+        selectors[8] = handler.reindex.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
 
@@ -253,6 +328,29 @@ contract AskSwarmRegistryIndexInvariantTest is RegistryTestSupport {
             assertTrue(registry.latestFor(handler.question(q)) != bytes32(0));
         }
         handler.ask(0, 0.5 ether);
+    }
+
+    /// The handlers the campaign relies on reach the states they check: a stranded ask marked
+    /// `Lost`, and a `reindex` move onto a weaker but still-valid answer once the held one expires.
+    function test_handlersReachLostAndReindexMoves() public {
+        bytes32 stranded = handler.ids(3);
+        handler.strand(3, 1);
+        handler.markLost(3, 0);
+        (AskSwarmRegistry.Ask memory k,) = registry.get(stranded);
+        assertEq(uint8(k.status), uint8(AskSwarmRegistry.Status.Lost));
+        assertEq(handler.lostMarked(), 1);
+
+        handler.ask(0, 0.5 ether);
+        bytes32 small = handler.ids(4);
+        handler.deliver(4, 0, 3, 2, 2, 2 days, 2, 0); // 2 of 3, valid 2 days: not indexed over 11 of 15
+        assertTrue(registry.latestFor(handler.question(0)) != small);
+        handler.reindex(4, 0);
+        assertEq(handler.reindexMoves(), 0, "reindex displaced a current, stronger answer");
+
+        handler.warp(1 days + 1);
+        handler.reindex(4, 1);
+        assertEq(handler.reindexMoves(), 1);
+        assertEq(registry.latestFor(handler.question(0)), small);
     }
 
     function invariant_registryHoldsNothingAndForwardsEveryFee() public view {
@@ -281,7 +379,12 @@ contract AskSwarmRegistryIndexInvariantTest is RegistryTestSupport {
         for (uint256 i; i < handler.count(); ++i) {
             bytes32 id = handler.ids(i);
             (AskSwarmRegistry.Ask memory k, AskSwarmRegistry.Answer memory a) = registry.get(id);
+            (,,, bool completed) = intake.requests(id);
+            if (k.status == AskSwarmRegistry.Status.Lost) {
+                assertTrue(completed && handler.stranded(id), "Lost without an undelivered completion");
+            }
             if (handler.settled(id)) {
+                assertTrue(completed, "settled an ask Intake never completed");
                 assertTrue(uint8(k.status) >= uint8(AskSwarmRegistry.Status.Answered));
                 assertEq(keccak256(abi.encode(k, a)), handler.recordHash(id));
             } else {
