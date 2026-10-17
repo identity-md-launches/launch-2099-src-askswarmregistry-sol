@@ -49,3 +49,25 @@ The findings that campaign reported (settled-record overwrite through another re
 future issuance beyond the canonical clock tolerance) are fixed in the contract and covered by the
 tests above; see `ADAPTATION.md` at the repository root. The cached domain after a chain-id-changing
 fork is unchanged: answers on the forked chain would fail to verify rather than be accepted.
+
+## Third pass: hostile inputs and index transitions
+
+- `AskSwarmRegistryAdversarial.t.sol`:
+  - Answers from 4,097 bytes up to 64 KiB settle `Unverified` inside the 200k stipend and never move the index.
+  - A 4,096-byte verified majority displaces a held answer with every slot cold.
+  - Callback gas is measured by a probe at the Intake address making the 200k call. A one-word answer to a fresh question costs about 116.6k and the 4,096-byte cap about 154.3k. The brief quotes ~105k.
+  - Any failure status from 1 to 255 settles the ask once.
+  - One fuzzed attestation drives every verification condition (signer, domain, quorum, expiry, issuance tolerance) on both sides.
+  - Also covered: the high-s twin, 0/1 recovery ids, a contract as the asker (not `tx.origin`), repeated identical bodies, and reads of keys nothing touched.
+- `AskSwarmRegistryIndexInvariant.t.sol`:
+  - Runs 192 sequences of 64 calls. Honest and hostile deliveries (wrong key, other registry's domain, high-s, 64-byte signature, oversized answer, a field changed after signing, issuance up to 10 minutes ahead) mix with failures of any status, replays of settled ids, direct hook calls from every non-Intake caller, and time jumps.
+  - After every call, whichever handler made it: an index move goes only to an `Answered`, verified, strict-majority answer of the same question, and never to a smaller panel or lower agreement while the held answer is current.
+  - Settled records are byte-identical to their snapshot, the registry holds no IMD, ETH or Intake allowance, and every fee reaches Intake's recipient.
+
+Reported in `.imd-findings.json`, not asserted:
+- An equal-strength answer that expires sooner evicts a still-current answer from `latestFor` (low, with a failing proof).
+- The callback's gas cost against the brief's figure (info).
+- Lost callbacks leave asks Pending forever (info).
+- `ask` has no maximum price (info).
+
+The live-fork run against Intake v2 and IMD on Ethereum is still owed for this pass. Everything here runs offline against the transport model.
